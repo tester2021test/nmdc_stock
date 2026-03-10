@@ -1,24 +1,19 @@
 """
-NMDC Stock Analyzer - Intraday & Swing Trade Strategy
-Author: 30-Year Market Experience System
-Capital: ₹1,00,000
-Exchange: NSE (NMDC.NS)
+NMDC Stock Analyzer — Intraday & Swing Trade Strategy
+Uses: yfinance + ta (technical-analysis library, pandas 3.x compatible)
+Capital: Rs 1,00,000  |  Exchange: NSE (NMDC.NS)
 """
 
-import os
-import time
-import logging
-import traceback
-import csv
-from datetime import datetime, timedelta
+import os, time, logging, csv
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import ta
 import requests
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -26,40 +21,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("NMDC")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-TICKER          = "NMDC.NS"
-CAPITAL         = 100_000          # ₹1 lakh
-RISK_PCT        = 0.015            # 1.5% risk per trade  → ₹1,500
-MAX_INTRADAY_LOTS = 0.40           # max 40% capital in one intraday trade
-MAX_SWING_LOTS    = 0.60           # max 60% capital in one swing trade
-IST             = ZoneInfo("Asia/Kolkata")
-MARKET_OPEN     = (9, 15)
-MARKET_CLOSE    = (15, 30)
+# Config
+TICKER            = "NMDC.NS"
+CAPITAL           = 100_000
+RISK_PCT          = 0.015
+MAX_INTRADAY_CAP  = 0.40
+MAX_SWING_CAP     = 0.60
+IST               = ZoneInfo("Asia/Kolkata")
+MARKET_OPEN       = (9, 15)
+MARKET_CLOSE      = (15, 30)
 
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT   = os.environ.get("TELEGRAM_CHAT_ID", "")
-CSV_PATH        = "results/nmdc_signals.csv"
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT     = os.environ.get("TELEGRAM_CHAT_ID", "")
+CSV_PATH          = "results/nmdc_signals.csv"
 
-RETRY_ATTEMPTS  = 5
-RETRY_DELAY     = 8                # seconds between retries
+RETRY_ATTEMPTS    = 5
+RETRY_DELAY       = 8
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# UTILITY
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Utilities ────────────────────────────────────────────────────────────────
 
 def is_market_open() -> bool:
     now = datetime.now(IST)
-    if now.weekday() >= 5:          # Saturday / Sunday
+    if now.weekday() >= 5:
         return False
-    h, m = now.hour, now.minute
-    open_min  = MARKET_OPEN[0]  * 60 + MARKET_OPEN[1]
-    close_min = MARKET_CLOSE[0] * 60 + MARKET_CLOSE[1]
-    return open_min <= (h * 60 + m) <= close_min
-
+    t = now.hour * 60 + now.minute
+    return (MARKET_OPEN[0]*60+MARKET_OPEN[1]) <= t <= (MARKET_CLOSE[0]*60+MARKET_CLOSE[1])
 
 def retry(fn, attempts=RETRY_ATTEMPTS, delay=RETRY_DELAY):
-    """Generic retry wrapper with exponential back-off."""
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
@@ -67,518 +55,403 @@ def retry(fn, attempts=RETRY_ATTEMPTS, delay=RETRY_DELAY):
         except Exception as exc:
             last_exc = exc
             wait = delay * attempt
-            log.warning(f"Attempt {attempt}/{attempts} failed: {exc}. Retrying in {wait}s…")
+            log.warning(f"Attempt {attempt}/{attempts} failed: {exc}. Retry in {wait}s...")
             time.sleep(wait)
-    raise RuntimeError(f"All {attempts} attempts failed: {last_exc}") from last_exc
+    raise RuntimeError(f"All {attempts} attempts failed. Last: {last_exc}") from last_exc
 
+def sf(val, default=0.0) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return default
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATA FETCH
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Data Fetch ───────────────────────────────────────────────────────────────
+
+def normalise(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0].lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
+    return df.dropna()
 
 def fetch_intraday() -> pd.DataFrame:
-    """Fetch last 5 days of 5-min OHLCV for intraday analysis."""
-    def _fetch():
-        df = yf.download(TICKER, period="5d", interval="5m",
-                         auto_adjust=True, progress=False)
+    def _f():
+        df = yf.download(TICKER, period="5d", interval="5m", auto_adjust=True, progress=False)
         if df.empty:
-            raise ValueError("Empty intraday data returned")
-        df.columns = [c.lower() if isinstance(c, str) else c[0].lower()
-                      for c in df.columns]
-        df = df.dropna()
-        return df
-    return retry(_fetch)
-
+            raise ValueError("Empty intraday data")
+        return normalise(df)
+    return retry(_f)
 
 def fetch_daily() -> pd.DataFrame:
-    """Fetch 200 days of daily OHLCV for swing analysis."""
-    def _fetch():
-        df = yf.download(TICKER, period="200d", interval="1d",
-                         auto_adjust=True, progress=False)
+    def _f():
+        df = yf.download(TICKER, period="250d", interval="1d", auto_adjust=True, progress=False)
         if df.empty:
-            raise ValueError("Empty daily data returned")
-        df.columns = [c.lower() if isinstance(c, str) else c[0].lower()
-                      for c in df.columns]
-        df = df.dropna()
-        return df
-    return retry(_fetch)
+            raise ValueError("Empty daily data")
+        return normalise(df)
+    return retry(_f)
 
+# ─── Indicators ───────────────────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# INDICATORS
-# ═══════════════════════════════════════════════════════════════════════════════
+def add_supertrend(df: pd.DataFrame, period=7, multiplier=3.0) -> pd.DataFrame:
+    atr   = df["atr"]
+    hl2   = (df["high"] + df["low"]) / 2
+    upper = hl2 + multiplier * atr
+    lower = hl2 - multiplier * atr
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # Trend
-    df["ema9"]  = ta.ema(df["close"], length=9)
-    df["ema21"] = ta.ema(df["close"], length=21)
-    df["ema50"] = ta.ema(df["close"], length=50)
-    df["ema200"]= ta.ema(df["close"], length=200)
+    st_dir  = [1] * len(df)
+    st_line = [0.0] * len(df)
 
-    # Momentum
-    df["rsi"]   = ta.rsi(df["close"], length=14)
+    for i in range(1, len(df)):
+        prev_dir = st_dir[i-1]
+        if prev_dir == 1:
+            f_lower = max(lower.iloc[i], st_line[i-1])
+            f_upper = upper.iloc[i]
+        else:
+            f_upper = min(upper.iloc[i], st_line[i-1])
+            f_lower = lower.iloc[i]
 
-    # MACD
-    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    df["macd"]        = macd["MACD_12_26_9"]
-    df["macd_signal"] = macd["MACDs_12_26_9"]
-    df["macd_hist"]   = macd["MACDh_12_26_9"]
+        curr = df["close"].iloc[i]
+        if prev_dir == 1:
+            if curr > f_upper:
+                st_dir[i]  = -1
+                st_line[i] = f_upper
+            else:
+                st_dir[i]  = 1
+                st_line[i] = f_lower
+        else:
+            if curr < f_lower:
+                st_dir[i]  = 1
+                st_line[i] = f_lower
+            else:
+                st_dir[i]  = -1
+                st_line[i] = f_upper
 
-    # Bollinger Bands
-    bbands = ta.bbands(df["close"], length=20, std=2)
-    df["bb_upper"] = bbands["BBU_20_2.0"]
-    df["bb_mid"]   = bbands["BBM_20_2.0"]
-    df["bb_lower"] = bbands["BBL_20_2.0"]
-
-    # ATR (for position sizing & SL)
-    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-
-    # Supertrend
-    st = ta.supertrend(df["high"], df["low"], df["close"], length=7, multiplier=3)
-    df["supertrend"]     = st[f"SUPERT_7_3.0"]
-    df["supertrend_dir"] = st[f"SUPERTd_7_3.0"]
-
-    # VWAP (intraday only — resets per day)
-    if "volume" in df.columns:
-        df["vwap"] = ta.vwap(df["high"], df["low"], df["close"], df["volume"])
-
-    # Volume MA
-    df["vol_ma20"] = ta.sma(df["volume"], length=20)
-
+    df["supertrend"]     = st_line
+    df["supertrend_dir"] = st_dir
     return df
 
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df    = df.copy()
+    c, h, l = df["close"], df["high"], df["low"]
+    vol   = df.get("volume", pd.Series(0, index=df.index))
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# INTRADAY STRATEGY  (5-min chart)
-# ═══════════════════════════════════════════════════════════════════════════════
+    df["ema9"]   = ta.trend.EMAIndicator(c, window=9).ema_indicator()
+    df["ema21"]  = ta.trend.EMAIndicator(c, window=21).ema_indicator()
+    df["ema50"]  = ta.trend.EMAIndicator(c, window=50).ema_indicator()
+    df["ema200"] = ta.trend.EMAIndicator(c, window=200).ema_indicator()
+    df["rsi"]    = ta.momentum.RSIIndicator(c, window=14).rsi()
+
+    macd = ta.trend.MACD(c, window_fast=12, window_slow=26, window_sign=9)
+    df["macd"]        = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    df["macd_hist"]   = macd.macd_diff()
+
+    bb = ta.volatility.BollingerBands(c, window=20, window_dev=2)
+    df["bb_upper"] = bb.bollinger_hband()
+    df["bb_lower"] = bb.bollinger_lband()
+
+    df["atr"] = ta.volatility.AverageTrueRange(h, l, c, window=14).average_true_range()
+
+    df = add_supertrend(df)
+
+    if vol.sum() > 0:
+        df["vwap"] = ta.volume.VolumeWeightedAveragePrice(h, l, c, vol, window=14).volume_weighted_average_price()
+    else:
+        df["vwap"] = c
+
+    df["vol_ma20"] = vol.rolling(20).mean().replace(0, 1)
+    return df
+
+# ─── Position Sizer ───────────────────────────────────────────────────────────
+
+def size_position(price, sl, max_cap_ratio):
+    risk_ps = abs(price - sl)
+    if risk_ps <= 0:
+        return 0, 0.0
+    qty = int((CAPITAL * RISK_PCT) / risk_ps)
+    cap = qty * price
+    max_cap = CAPITAL * max_cap_ratio
+    if cap > max_cap:
+        qty = int(max_cap / price)
+        cap = qty * price
+    return max(qty, 0), round(cap, 2)
+
+# ─── Intraday Strategy ────────────────────────────────────────────────────────
 
 def intraday_signal(df5: pd.DataFrame) -> dict:
-    """
-    Multi-filter intraday strategy:
-      1. EMA 9/21 crossover (entry trigger)
-      2. Supertrend direction confirmation
-      3. RSI momentum filter (35–65 zone gives momentum room)
-      4. Volume > 1.5× 20-bar average (smart money confirmation)
-      5. Price vs VWAP (bias filter)
-      6. MACD histogram direction
-    """
-    df  = df5.copy().dropna(subset=["ema9","ema21","rsi","supertrend_dir","vwap"])
-    row = df.iloc[-1]
-    prev= df.iloc[-2]
-
-    price   = float(row["close"])
-    atr     = float(row["atr"])
-    vol     = float(row["volume"])
-    vol_avg = float(row["vol_ma20"])
-
-    # ── Score-based signal ──
-    bull_score = 0
-    bear_score = 0
-
-    # 1. EMA cross
-    if prev["ema9"] < prev["ema21"] and row["ema9"] > row["ema21"]:
-        bull_score += 3        # fresh bullish cross = strong
-    elif row["ema9"] > row["ema21"]:
-        bull_score += 1
-    if prev["ema9"] > prev["ema21"] and row["ema9"] < row["ema21"]:
-        bear_score += 3
-    elif row["ema9"] < row["ema21"]:
-        bear_score += 1
-
-    # 2. Supertrend
-    if row["supertrend_dir"] == 1:
-        bull_score += 2
-    else:
-        bear_score += 2
-
-    # 3. RSI
-    rsi = float(row["rsi"])
-    if 50 < rsi < 75:
-        bull_score += 2
-    elif 25 < rsi < 50:
-        bear_score += 2
-    elif rsi >= 75:
-        bear_score += 1          # overbought → fade
-    elif rsi <= 25:
-        bull_score += 1          # oversold → potential reversal
-
-    # 4. Volume spike
-    vol_ratio = vol / vol_avg if vol_avg > 0 else 1
-    if vol_ratio >= 1.5:
-        if bull_score > bear_score:
-            bull_score += 2
-        else:
-            bear_score += 2
-
-    # 5. VWAP bias
-    vwap = float(row["vwap"])
-    if price > vwap:
-        bull_score += 1
-    else:
-        bear_score += 1
-
-    # 6. MACD histogram
-    if float(row["macd_hist"]) > 0 and float(row["macd_hist"]) > float(prev["macd_hist"]):
-        bull_score += 1
-    elif float(row["macd_hist"]) < 0 and float(row["macd_hist"]) < float(prev["macd_hist"]):
-        bear_score += 1
-
-    # ── Decision  (need score ≥ 7 to fire) ──
-    MIN_SCORE = 7
-    if bull_score >= MIN_SCORE and bull_score > bear_score + 2:
-        direction  = "BUY"
-        sl         = round(price - 1.5 * atr, 2)
-        target1    = round(price + 2.0 * atr, 2)
-        target2    = round(price + 3.5 * atr, 2)
-        confidence = min(100, int((bull_score / 12) * 100))
-    elif bear_score >= MIN_SCORE and bear_score > bull_score + 2:
-        direction  = "SELL_SHORT"
-        sl         = round(price + 1.5 * atr, 2)
-        target1    = round(price - 2.0 * atr, 2)
-        target2    = round(price - 3.5 * atr, 2)
-        confidence = min(100, int((bear_score / 12) * 100))
-    else:
-        direction  = "HOLD"
-        sl         = target1 = target2 = 0.0
-        confidence = 0
-
-    # ── Position sizing (Risk-based) ──
-    qty = 0
-    capital_allocated = 0
-    risk_per_share = abs(price - sl) if sl else 0
-    if direction != "HOLD" and risk_per_share > 0:
-        risk_amount = CAPITAL * RISK_PCT
-        qty = int(risk_amount / risk_per_share)
-        capital_allocated = round(qty * price, 2)
-        max_cap = CAPITAL * MAX_INTRADAY_LOTS
-        if capital_allocated > max_cap:
-            qty = int(max_cap / price)
-            capital_allocated = round(qty * price, 2)
-
-    return {
-        "type"             : "INTRADAY",
-        "signal"           : direction,
-        "price"            : round(price, 2),
-        "sl"               : sl,
-        "target1"          : target1,
-        "target2"          : target2,
-        "qty"              : qty,
-        "capital_deployed" : capital_allocated,
-        "confidence_pct"   : confidence,
-        "rsi"              : round(rsi, 1),
-        "vwap"             : round(vwap, 2),
-        "vol_ratio"        : round(vol_ratio, 2),
-        "atr"              : round(atr, 2),
-        "bull_score"       : bull_score,
-        "bear_score"       : bear_score,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SWING STRATEGY  (daily chart)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def swing_signal(dfd: pd.DataFrame) -> dict:
-    """
-    Swing trade strategy (2–15 day hold):
-      1. Price above/below EMA50 (primary trend)
-      2. EMA21 vs EMA50 slope
-      3. MACD crossover on daily
-      4. RSI pullback entries (50–60 for long; 40–50 for short)
-      5. Bollinger Band squeeze (low ATR/BB width = breakout upcoming)
-      6. 52-week range context
-    """
-    df   = dfd.copy().dropna(subset=["ema21","ema50","rsi","macd"])
+    df   = df5.dropna(subset=["ema9","ema21","rsi","supertrend_dir"]).copy()
     row  = df.iloc[-1]
     prev = df.iloc[-2]
 
-    price   = float(row["close"])
-    atr     = float(row["atr"])
+    price     = sf(row["close"])
+    atr       = sf(row["atr"])
+    vol       = sf(row.get("volume", 1))
+    vol_avg   = sf(row.get("vol_ma20", 1))
+    vwap      = sf(row.get("vwap", price))
+    vol_ratio = round(vol / vol_avg, 2) if vol_avg > 0 else 1.0
+    rsi       = sf(row["rsi"])
 
-    bull_score = 0
-    bear_score = 0
+    bull = bear = 0
 
-    # 1. EMA50 trend
-    if price > float(row["ema50"]):
-        bull_score += 2
+    # 1. EMA 9/21 cross
+    if sf(prev["ema9"]) < sf(prev["ema21"]) and sf(row["ema9"]) > sf(row["ema21"]):
+        bull += 3
+    elif sf(row["ema9"]) > sf(row["ema21"]):
+        bull += 1
+    if sf(prev["ema9"]) > sf(prev["ema21"]) and sf(row["ema9"]) < sf(row["ema21"]):
+        bear += 3
+    elif sf(row["ema9"]) < sf(row["ema21"]):
+        bear += 1
+
+    # 2. Supertrend
+    if row["supertrend_dir"] == 1: bull += 2
+    else:                           bear += 2
+
+    # 3. RSI
+    if 50 < rsi < 75:    bull += 2
+    elif 25 < rsi < 50:  bear += 2
+    elif rsi >= 75:       bear += 1
+    elif rsi <= 25:       bull += 1
+
+    # 4. Volume spike
+    if vol_ratio >= 1.5:
+        if bull >= bear: bull += 2
+        else:            bear += 2
+
+    # 5. VWAP
+    if price > vwap: bull += 1
+    else:            bear += 1
+
+    # 6. MACD histogram slope
+    h_now  = sf(row["macd_hist"])
+    h_prev = sf(prev["macd_hist"])
+    if h_now > 0 and h_now > h_prev:   bull += 1
+    elif h_now < 0 and h_now < h_prev: bear += 1
+
+    MIN = 7
+    if bull >= MIN and bull >= bear + 2:
+        sig  = "BUY"
+        sl   = round(price - 1.5*atr, 2)
+        t1   = round(price + 2.0*atr, 2)
+        t2   = round(price + 3.5*atr, 2)
+        conf = min(100, int(bull/12*100))
+    elif bear >= MIN and bear >= bull + 2:
+        sig  = "SELL_SHORT"
+        sl   = round(price + 1.5*atr, 2)
+        t1   = round(price - 2.0*atr, 2)
+        t2   = round(price - 3.5*atr, 2)
+        conf = min(100, int(bear/12*100))
     else:
-        bear_score += 2
+        sig  = "HOLD"
+        sl = t1 = t2 = 0.0
+        conf = 0
 
-    # 2. EMA21 > EMA50 (golden alignment)
-    if float(row["ema21"]) > float(row["ema50"]):
-        bull_score += 2
-    else:
-        bear_score += 2
+    qty, cap = size_position(price, sl, MAX_INTRADAY_CAP) if sig != "HOLD" else (0, 0.0)
+    return dict(type="INTRADAY", signal=sig, price=price, sl=sl, target1=t1, target2=t2,
+                qty=qty, capital_deployed=cap, confidence_pct=conf, rsi=round(rsi,1),
+                vwap=round(vwap,2), vol_ratio=vol_ratio, atr=round(atr,2),
+                bull_score=bull, bear_score=bear)
+
+# ─── Swing Strategy ───────────────────────────────────────────────────────────
+
+def swing_signal(dfd: pd.DataFrame) -> dict:
+    df   = dfd.dropna(subset=["ema21","ema50","rsi","macd","supertrend_dir"]).copy()
+    row  = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    price = sf(row["close"])
+    atr   = sf(row["atr"])
+    rsi   = sf(row["rsi"])
+    bull  = bear = 0
+
+    # 1. Price vs EMA50
+    if price > sf(row["ema50"]): bull += 2
+    else:                         bear += 2
+
+    # 2. EMA21 vs EMA50
+    if sf(row["ema21"]) > sf(row["ema50"]): bull += 2
+    else:                                     bear += 2
 
     # 3. MACD crossover
-    if prev["macd"] < prev["macd_signal"] and row["macd"] > row["macd_signal"]:
-        bull_score += 3
-    elif row["macd"] > row["macd_signal"]:
-        bull_score += 1
-    if prev["macd"] > prev["macd_signal"] and row["macd"] < row["macd_signal"]:
-        bear_score += 3
-    elif row["macd"] < row["macd_signal"]:
-        bear_score += 1
+    if sf(prev["macd"]) < sf(prev["macd_signal"]) and sf(row["macd"]) > sf(row["macd_signal"]):
+        bull += 3
+    elif sf(row["macd"]) > sf(row["macd_signal"]):
+        bull += 1
+    if sf(prev["macd"]) > sf(prev["macd_signal"]) and sf(row["macd"]) < sf(row["macd_signal"]):
+        bear += 3
+    elif sf(row["macd"]) < sf(row["macd_signal"]):
+        bear += 1
 
-    # 4. RSI zone
-    rsi = float(row["rsi"])
-    if 50 <= rsi <= 65:
-        bull_score += 2          # momentum without being overbought
-    elif 35 <= rsi < 50:
-        bear_score += 2
-    elif rsi > 70:
-        bear_score += 1
-    elif rsi < 30:
-        bull_score += 1
+    # 4. RSI
+    if 50 <= rsi <= 65:  bull += 2
+    elif 35 <= rsi < 50: bear += 2
+    elif rsi > 70:        bear += 1
+    elif rsi < 30:        bull += 1
 
     # 5. Supertrend
-    if row["supertrend_dir"] == 1:
-        bull_score += 2
-    else:
-        bear_score += 2
+    if row["supertrend_dir"] == 1: bull += 2
+    else:                           bear += 2
 
     # 6. 52-week range
-    high52 = float(df["high"].rolling(252).max().iloc[-1])
-    low52  = float(df["low"].rolling(252).min().iloc[-1])
-    range52= high52 - low52
-    pos52  = (price - low52) / range52 if range52 > 0 else 0.5
-    if 0.5 <= pos52 <= 0.85:
-        bull_score += 1          # mid-upper range — uptrend in motion
-    elif pos52 < 0.3:
-        bull_score += 1          # deep value
+    h52   = df["high"].rolling(252, min_periods=50).max().iloc[-1]
+    l52   = df["low"].rolling(252, min_periods=50).min().iloc[-1]
+    rng52 = sf(h52 - l52)
+    pos52 = (price - sf(l52)) / rng52 if rng52 > 0 else 0.5
+    if 0.5 <= pos52 <= 0.85: bull += 1
+    elif pos52 < 0.30:        bull += 1
 
-    # ── Decision  (score ≥ 8 for swing) ──
-    MIN_SCORE = 8
-    if bull_score >= MIN_SCORE and bull_score > bear_score + 2:
-        direction = "BUY"
-        sl        = round(price - 2.0 * atr, 2)
-        target1   = round(price + 3.0 * atr, 2)
-        target2   = round(price + 5.0 * atr, 2)
-        confidence= min(100, int((bull_score / 14) * 100))
-    elif bear_score >= MIN_SCORE and bear_score > bull_score + 2:
-        direction = "SELL_SHORT"
-        sl        = round(price + 2.0 * atr, 2)
-        target1   = round(price - 3.0 * atr, 2)
-        target2   = round(price - 5.0 * atr, 2)
-        confidence= min(100, int((bear_score / 14) * 100))
+    MIN = 8
+    if bull >= MIN and bull >= bear + 2:
+        sig  = "BUY"
+        sl   = round(price - 2.0*atr, 2)
+        t1   = round(price + 3.0*atr, 2)
+        t2   = round(price + 5.0*atr, 2)
+        conf = min(100, int(bull/14*100))
+    elif bear >= MIN and bear >= bull + 2:
+        sig  = "SELL_SHORT"
+        sl   = round(price + 2.0*atr, 2)
+        t1   = round(price - 3.0*atr, 2)
+        t2   = round(price - 5.0*atr, 2)
+        conf = min(100, int(bear/14*100))
     else:
-        direction = "HOLD"
-        sl = target1 = target2 = 0.0
-        confidence = 0
+        sig  = "HOLD"
+        sl = t1 = t2 = 0.0
+        conf = 0
 
-    # ── Position sizing ──
-    qty = 0
-    capital_allocated = 0
-    risk_per_share = abs(price - sl) if sl else 0
-    if direction != "HOLD" and risk_per_share > 0:
-        risk_amount = CAPITAL * RISK_PCT
-        qty = int(risk_amount / risk_per_share)
-        capital_allocated = round(qty * price, 2)
-        max_cap = CAPITAL * MAX_SWING_LOTS
-        if capital_allocated > max_cap:
-            qty = int(max_cap / price)
-            capital_allocated = round(qty * price, 2)
+    hold  = "2-5 days" if abs(bull-bear) <= 4 else "5-15 days"
+    qty, cap = size_position(price, sl, MAX_SWING_CAP) if sig != "HOLD" else (0, 0.0)
+    return dict(type="SWING", signal=sig, price=price, sl=sl, target1=t1, target2=t2,
+                qty=qty, capital_deployed=cap, confidence_pct=conf, rsi=round(rsi,1),
+                pos_52w_pct=round(pos52*100,1), atr=round(atr,2), hold_period=hold,
+                bull_score=bull, bear_score=bear)
 
-    # Hold period estimate
-    hold_days = "2–5 days" if abs(bull_score - bear_score) <= 4 else "5–15 days"
+# ─── Telegram ─────────────────────────────────────────────────────────────────
 
-    return {
-        "type"             : "SWING",
-        "signal"           : direction,
-        "price"            : round(price, 2),
-        "sl"               : sl,
-        "target1"          : target1,
-        "target2"          : target2,
-        "qty"              : qty,
-        "capital_deployed" : capital_allocated,
-        "confidence_pct"   : confidence,
-        "rsi"              : round(rsi, 1),
-        "pos_52w_pct"      : round(pos52 * 100, 1),
-        "atr"              : round(atr, 2),
-        "hold_period"      : hold_days,
-        "bull_score"       : bull_score,
-        "bear_score"       : bear_score,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def format_telegram_message(intra: dict, swing: dict) -> str:
+def format_message(intra: dict, swing: dict) -> str:
     ts   = datetime.now(IST).strftime("%d-%b-%Y %H:%M IST")
-    emoji_map = {"BUY": "🟢", "SELL_SHORT": "🔴", "HOLD": "⚪"}
+    emap = {"BUY": "🟢", "SELL_SHORT": "🔴", "HOLD": "⚪"}
 
-    def fmt_block(s: dict) -> str:
-        e = emoji_map.get(s["signal"], "⚪")
-        rr = 0
-        if s["sl"] and s["target1"] and s["price"]:
-            risk   = abs(s["price"] - s["sl"])
-            reward = abs(s["target1"] - s["price"])
-            rr     = round(reward / risk, 2) if risk > 0 else 0
+    def rr(s):
+        risk = abs(s["price"] - s["sl"])
+        if risk <= 0: return "-"
+        return f"1:{round(abs(s['target1'] - s['price']) / risk, 1)}"
 
-        if s["signal"] != "HOLD":
-            cap = f"₹{s['capital_deployed']:,}" if isinstance(s.get('capital_deployed'), (int, float)) else "—"
-            lines = [
-                f"{e} *{s['signal']}*  |  LTP: ₹{s['price']}",
-                f"  📉 SL: ₹{s['sl']}   📈 T1: ₹{s['target1']}   🎯 T2: ₹{s['target2']}",
-                f"  Qty: {s['qty']} shares  |  Capital: {cap}",
-                f"  R:R = 1:{rr}  |  Confidence: {s['confidence_pct']}%",
-                f"  RSI: {s['rsi']}  |  ATR: ₹{s['atr']}",
-            ]
-            if s.get("vol_ratio"):
-                lines.append(f"  Volume ratio: {s['vol_ratio']}× avg")
-            if s.get("vwap"):
-                lines.append(f"  VWAP: ₹{s['vwap']}")
-            if s.get("hold_period"):
-                lines.append(f"  Hold: {s['hold_period']}")
-            if s.get("pos_52w_pct"):
-                lines.append(f"  52W position: {s['pos_52w_pct']}%")
-        else:
-            lines = [f"{e} *HOLD / NO TRADE*  |  LTP: ₹{s['price']}",
-                     f"  RSI: {s['rsi']}  |  Score B:{s['bull_score']} S:{s['bear_score']}"]
-
+    def block(s):
+        e = emap.get(s["signal"], "⚪")
+        if s["signal"] == "HOLD":
+            return (f"{e} *HOLD / NO TRADE*  |  LTP: Rs{s['price']}\n"
+                    f"  RSI: {s['rsi']}  |  Bull: {s['bull_score']}  Bear: {s['bear_score']}")
+        lines = [
+            f"{e} *{s['signal']}*  |  LTP: Rs{s['price']}",
+            f"  SL: Rs{s['sl']}",
+            f"  T1: Rs{s['target1']}   T2: Rs{s['target2']}",
+            f"  Qty: {s['qty']} shares  |  Capital: Rs{s['capital_deployed']:,}",
+            f"  R:R = {rr(s)}  |  Confidence: {s['confidence_pct']}%",
+            f"  RSI: {s['rsi']}  |  ATR: Rs{s['atr']}",
+        ]
+        if s.get("vol_ratio"):
+            lines.append(f"  Volume: {s['vol_ratio']}x avg  |  VWAP: Rs{s.get('vwap','-')}")
+        if s.get("hold_period"):
+            lines.append(f"  Hold: {s['hold_period']}  |  52W pos: {s.get('pos_52w_pct','-')}%")
         return "\n".join(lines)
 
-    msg = (
-        f"📊 *NMDC (NSE) Signal Report*\n"
-        f"🕐 {ts}\n"
-        f"💰 Capital: ₹{CAPITAL:,}  |  Risk/Trade: {RISK_PCT*100}%\n"
-        f"{'─'*35}\n\n"
-        f"⚡ *INTRADAY (5-min)*\n{fmt_block(intra)}\n\n"
-        f"📅 *SWING TRADE (Daily)*\n{fmt_block(swing)}\n\n"
-        f"{'─'*35}\n"
-        f"⚠️ _Not SEBI advice. Trade at your own risk._"
+    return (
+        f"NMDC (NSE) Signal Update\n"
+        f"Time: {ts}\n"
+        f"Capital Rs{CAPITAL:,}  |  Risk 1.5pct per trade\n"
+        f"------------------------------------\n\n"
+        f"INTRADAY (5-min chart)\n{block(intra)}\n\n"
+        f"SWING TRADE (Daily chart)\n{block(swing)}\n\n"
+        f"------------------------------------\n"
+        f"Educational use only. Not SEBI advice."
     )
-    return msg
-
 
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        log.warning("Telegram credentials not set — skipping notification.")
+        log.warning("Telegram creds missing - skipping.")
         return False
-
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     def _send():
-        resp = requests.post(url, json={
-            "chat_id"   : TELEGRAM_CHAT,
-            "text"      : message,
-            "parse_mode": "Markdown"
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT, "text": message
         }, timeout=15)
-        resp.raise_for_status()
-        return True
-
+        r.raise_for_status()
     try:
-        return retry(_send, attempts=3, delay=5)
+        retry(_send, attempts=3, delay=4)
+        return True
     except Exception as e:
-        log.error(f"Telegram send failed: {e}")
+        log.error(f"Telegram failed: {e}")
         return False
 
+# ─── CSV Logger ───────────────────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CSV LOGGING
-# ═══════════════════════════════════════════════════════════════════════════════
+FIELDS = ["timestamp","trade_type","signal","price","sl","target1","target2",
+          "qty","capital_deployed","confidence_pct","rsi","atr",
+          "bull_score","bear_score","extra_info"]
 
 def log_to_csv(intra: dict, swing: dict):
     os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
     ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-
-    fieldnames = [
-        "timestamp", "trade_type", "signal", "price",
-        "sl", "target1", "target2", "qty", "capital_deployed",
-        "confidence_pct", "rsi", "atr", "bull_score", "bear_score",
-        "extra_info"
-    ]
-
     write_header = not os.path.exists(CSV_PATH)
-
     def _write():
         with open(CSV_PATH, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            w = csv.DictWriter(f, fieldnames=FIELDS)
             if write_header:
-                writer.writeheader()
-
+                w.writeheader()
             for sig in [intra, swing]:
-                extra = {}
-                if sig["type"] == "INTRADAY":
-                    extra = {"vol_ratio": sig.get("vol_ratio"), "vwap": sig.get("vwap")}
-                else:
-                    extra = {"pos_52w_pct": sig.get("pos_52w_pct"), "hold_period": sig.get("hold_period")}
-
-                writer.writerow({
-                    "timestamp"        : ts,
-                    "trade_type"       : sig["type"],
-                    "signal"           : sig["signal"],
-                    "price"            : sig["price"],
-                    "sl"               : sig["sl"],
-                    "target1"          : sig["target1"],
-                    "target2"          : sig["target2"],
-                    "qty"              : sig["qty"],
-                    "capital_deployed" : sig["capital_deployed"],
-                    "confidence_pct"   : sig["confidence_pct"],
-                    "rsi"              : sig["rsi"],
-                    "atr"              : sig["atr"],
-                    "bull_score"       : sig["bull_score"],
-                    "bear_score"       : sig["bear_score"],
-                    "extra_info"       : str(extra),
+                extra = {k: sig[k] for k in sig if k not in FIELDS+["type"]}
+                w.writerow({
+                    "timestamp": ts, "trade_type": sig["type"],
+                    "signal": sig["signal"], "price": sig["price"],
+                    "sl": sig["sl"], "target1": sig["target1"], "target2": sig["target2"],
+                    "qty": sig["qty"], "capital_deployed": sig["capital_deployed"],
+                    "confidence_pct": sig["confidence_pct"], "rsi": sig["rsi"],
+                    "atr": sig["atr"], "bull_score": sig["bull_score"],
+                    "bear_score": sig["bear_score"], "extra_info": str(extra),
                 })
-
     retry(_write, attempts=3, delay=2)
-    log.info(f"Logged to CSV: {CSV_PATH}")
+    log.info(f"CSV updated: {CSV_PATH}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def run():
     log.info("=" * 60)
-    log.info(f"NMDC Analyzer starting — {datetime.now(IST).strftime('%d-%b-%Y %H:%M IST')}")
+    log.info(f"NMDC Analyzer - {datetime.now(IST).strftime('%d-%b-%Y %H:%M IST')}")
 
     if not is_market_open():
-        log.info("Market is CLOSED. Exiting.")
+        log.info("Market CLOSED. Exiting.")
         return
 
-    # 1. Fetch data
-    log.info("Fetching intraday data (5-min)…")
-    df5  = fetch_intraday()
-    log.info(f"  → {len(df5)} bars fetched")
+    log.info("Fetching 5-min intraday data...")
+    df5 = fetch_intraday()
+    log.info(f"  {len(df5)} bars")
 
-    log.info("Fetching daily data…")
-    dfd  = fetch_daily()
-    log.info(f"  → {len(dfd)} bars fetched")
+    log.info("Fetching daily data...")
+    dfd = fetch_daily()
+    log.info(f"  {len(dfd)} bars")
 
-    # 2. Add indicators
-    log.info("Computing indicators…")
-    df5  = add_indicators(df5)
-    dfd  = add_indicators(dfd)
+    log.info("Computing indicators...")
+    df5 = add_indicators(df5)
+    dfd = add_indicators(dfd)
 
-    # 3. Generate signals
-    log.info("Running intraday strategy…")
+    log.info("Running intraday strategy...")
     intra = intraday_signal(df5)
-    log.info(f"  → Intraday: {intra['signal']} @ ₹{intra['price']}  "
-             f"(conf {intra['confidence_pct']}%)")
+    log.info(f"  -> {intra['signal']} @ Rs{intra['price']}  conf={intra['confidence_pct']}%")
 
-    log.info("Running swing strategy…")
+    log.info("Running swing strategy...")
     swing = swing_signal(dfd)
-    log.info(f"  → Swing:    {swing['signal']} @ ₹{swing['price']}  "
-             f"(conf {swing['confidence_pct']}%)")
+    log.info(f"  -> {swing['signal']} @ Rs{swing['price']}  conf={swing['confidence_pct']}%")
 
-    # 4. Log to CSV
-    log.info("Writing to CSV…")
+    log.info("Logging to CSV...")
     log_to_csv(intra, swing)
 
-    # 5. Telegram
-    log.info("Sending Telegram alert…")
-    msg = format_telegram_message(intra, swing)
+    log.info("Sending Telegram alert...")
+    msg  = format_message(intra, swing)
     sent = send_telegram(msg)
-    log.info(f"  → Telegram: {'✓ sent' if sent else '✗ skipped'}")
+    log.info(f"  -> {'sent' if sent else 'skipped'}")
 
-    log.info("Run complete.")
+    log.info("Done.")
     log.info("=" * 60)
-
 
 if __name__ == "__main__":
     run()
