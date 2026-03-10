@@ -1,0 +1,5 @@
+yfinance>=0.2.38
+pandas>=2.1.0
+pandas-ta>=0.3.14b
+requests>=2.31.0
+pytz>=2024.1
